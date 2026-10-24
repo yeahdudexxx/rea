@@ -33,6 +33,7 @@ import {
 import {
   built,
   callOf,
+  clockEvidence,
   fail,
   itemReads,
   refuse,
@@ -47,6 +48,7 @@ import {
   type WriteStep,
 } from "./environmentStateWriteEffects.js";
 import {
+  createdInteger,
   explainCreate,
   insertCandidates,
   insertIndex,
@@ -61,13 +63,18 @@ import {
 } from "./environmentStateWriteObserve.js";
 import {
   pathValuesOf,
+  siblingTrimmedClocks,
   type FieldRule,
   type WriteCall,
 } from "./environmentStateWriteRules.js";
 import {
+  fittedClockFormat,
+  noteFixedWidths,
+} from "./environmentStateWriteClockFormats.js";
+import {
+  generatedIntegerDigits,
   isUuid,
   nextSequence,
-  readClock,
   sequenceNumber,
   spelledLike,
 } from "./environmentStateWriteValues.js";
@@ -133,6 +140,15 @@ const createdObservation = (
 const fieldsOf = (entities: readonly StateEntity[]): JsonObject[] =>
   entities.map((entity) => entity.fields);
 
+/** Whether a created field holds a generated token or integer that another field holds too, which no rule rebuilds. */
+const linkedGenerated = (
+  field: string,
+  entity: JsonObject,
+  type: readonly JsonObject[],
+): boolean =>
+  createdToken(field, entity, type) === "linked" ||
+  createdInteger(field, entity, type) === "linked";
+
 /** Build a create plan from its exemplar's observation. */
 const buildCreate = (
   context: EffectContext,
@@ -163,7 +179,7 @@ const buildCreate = (
     Object.keys(evidence.observed.object).some(
       (field) =>
         !explainedFields.has(field) &&
-        createdToken(field, evidence.observed.object, held) === "linked",
+        linkedGenerated(field, evidence.observed.object, held),
     )
   ) {
     refuse(draft, step, "unexplained-change");
@@ -221,6 +237,7 @@ const buildCreate = (
     insert: draft.candidates[0]!,
   });
   draft.observed = evidence.observed.object;
+  for (const entity of held) noteFixedWidths(draft.fixedWidth, entity);
   return true;
 };
 
@@ -269,6 +286,19 @@ const followsSequences = (
     );
   });
 
+/** Whether a value is a generated integer of the exemplar's length and JSON kind. */
+const likeGeneratedInteger = (
+  value: JsonValue | undefined,
+  exemplar: JsonValue | undefined,
+): boolean => {
+  const digits = generatedIntegerDigits(value);
+  return (
+    digits !== undefined &&
+    typeof value === typeof exemplar &&
+    digits.length === generatedIntegerDigits(exemplar)?.length
+  );
+};
+
 /** Whether a later call's generated values take the forms serving generates them in: clocks in the learned format, unique values as the exemplar's kind of token, UUID identities as UUIDs, and sequences in order. */
 const followsGenerated = (
   context: EffectContext,
@@ -277,13 +307,20 @@ const followsGenerated = (
 ): boolean =>
   draft.plan.rules.every((rule) => {
     const value = created.fields[rule.field];
+    const exemplar = draft.observed?.[rule.field];
     if (rule.rule === "clock")
       return (
-        JSON.stringify(readClock(value)?.format) === JSON.stringify(rule.format)
+        fittedClockFormat(
+          rule.format,
+          value,
+          clockEvidence(draft, rule.field),
+        ) !== undefined
       );
     if (rule.rule === "unique")
       return (
-        (isUuid(value) || isOpaqueToken(value, draft.observed?.[rule.field])) &&
+        (isUuid(value) ||
+          isOpaqueToken(value, exemplar) ||
+          likeGeneratedInteger(value, exemplar)) &&
         !context.state
           .ofType(created.type)
           .some((held) => held.fields[rule.field] === value)
@@ -292,6 +329,28 @@ const followsGenerated = (
       rule.rule !== "identity" || rule.generator !== "uuid" || isUuid(value)
     );
   }) && followsSequences(context, draft, created);
+
+/** Widen the plan's clock formats to the trimmed spelling a later call showed, and its other clocks with them unless a value the plan saw shows them at a fixed width. */
+const fitClocks = (draft: WriteDraft, fields: JsonObject): void => {
+  const fitted = draft.plan.rules.map((rule) => {
+    if (rule.rule !== "clock") return rule;
+    const format = fittedClockFormat(
+      rule.format,
+      fields[rule.field],
+      clockEvidence(draft, rule.field),
+    );
+    return format === undefined || format === rule.format
+      ? rule
+      : { ...rule, format };
+  });
+  draft.plan.rules = siblingTrimmedClocks(
+    fitted,
+    draft.observed,
+    fields,
+    Object.fromEntries(draft.fixedWidth),
+  );
+  noteFixedWidths(draft.fixedWidth, fields);
+};
 
 /** Record the values a create's sequences took, which the next call follows. */
 const takeSequences = (
@@ -461,11 +520,11 @@ export const applyCreate = (
     draft.plan.rules.some(
       (rule) =>
         rule.rule === "unique" &&
-        createdToken(
+        linkedGenerated(
           rule.field,
           observed.object,
           fieldsOf(context.state.ofType(type)),
-        ) === "linked",
+        ),
     )
   ) {
     refuse(draft, step, "unexplained-change");
@@ -510,6 +569,7 @@ export const applyCreate = (
     return recorded();
   }
   takeSequences(draft, { collection, fields: fields.value });
+  fitClocks(draft, fields.value);
   // The call's own values follow the forms serving generates; the state holds a nested clock as the read-back restamped it, as an update's.
   const stored = restampedFields(
     searchFrom(context, step),
